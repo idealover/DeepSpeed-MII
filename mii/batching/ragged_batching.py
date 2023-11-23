@@ -11,6 +11,7 @@ import time
 from collections import deque, defaultdict
 from functools import cached_property
 from typing import Dict, Tuple, List, Any, Union, DefaultDict
+from dataclasses import dataclass
 
 import torch
 import ujson
@@ -225,6 +226,7 @@ class RaggedBatchBase:
                 r.prompt_length,
                 r.num_generated_tokens,
                 GenerationFinishReason.NONE,
+                r.stream,
             ))
         if r.finish_reason != GenerationFinishReason.NONE:
             if r.stream or not r.generated_tokens:
@@ -241,6 +243,7 @@ class RaggedBatchBase:
                 r.prompt_length,
                 r.num_generated_tokens,
                 r.finish_reason,
+                r.stream,
             ))
         for output in outputs:
             self.result_queues[r.tid].put_nowait(output)
@@ -462,6 +465,43 @@ class RaggedBatchBase:
         for uid in uids:
             self.inference_engine.flush(uid)
 
+        
+@dataclass 
+class StreamState:
+    prev_token: str 
+    token_ids : List[int]
+
+class ReadableStream():
+    def __init__(self, tokenizer) -> None:
+        self.tokenizer = tokenizer
+        self.stream_state: Dict[int, StreamState] = {}
+
+    def init_state(self, thread_id: int) -> StreamState:
+        if thread_id not in self.stream_state:
+            self.stream_state[thread_id] = StreamState(prev_token=None, token_ids=[])
+        return self.stream_state[thread_id]
+
+    def flush_state(self, thread_id: int) -> None:
+        if thread_id in self.stream_state:
+            del self.stream_state[thread_id]
+
+    def decode(self, thread_id: int, token_ids: List[int]) -> str:
+        sstate = self.init_state(thread_id)
+        final = []
+        for tid in token_ids:
+            sstate.token_ids.append(tid)
+            r = self.tokenizer.decode(sstate.token_ids)
+            if " " in r:
+                if sstate.prev_tok is not None:
+                    r = r.replace(sstate.prev_tok, "")
+                    sstate.token_ids = [sstate.token_ids[-1]]
+            elif len(sstate.token_ids) > 1:
+                sstate.token_ids.pop(0)
+                r = r.replace(sstate.prev_tok, "")
+            sstate.prev_tok = self.tokenizer.decode(tid)
+            final.append(r)
+        return "".join(final)
+
 
 class MIIPipeline(RaggedBatchBase):
     def __init__(self, *args, **kwargs):
@@ -546,6 +586,7 @@ class MIIAsyncPipeline(RaggedBatchBase):
         self._is_shutdown = False
         self.UID_RANGE_LB = 1
         self.UID_RANGE_UB = 10000
+        self.readable_stream = ReadableStream(self.tokenizer)
 
     def __call__(self) -> None:
         # CUDA device gets reset, must set it again to avoid problems
@@ -603,14 +644,21 @@ class MIIAsyncPipeline(RaggedBatchBase):
                             generated_length=None,
                             finish_reason=None)
         tid = threading.get_ident()
-        result = self.result_queues[tid].get()
-        uid = result[0]
-        generated_token_ids = result[1]
+        # result = self.result_queues[tid].get()
+        # uid = result[0]
+        # generated_token_ids = result[1]
+        uid, generated_token_ids, prompt_length, generated_length, finish_reason, streaming = self.result_queues[tid].get()
         if len(generated_token_ids) == 0:
             generated_text = ""
+            self.readable_stream.flush_state(tid)
+        elif streaming:
+            generated_text = self.readable_stream.decode(tid, generated_token_ids)
         else:
             generated_text = self.tokenizer.decode(generated_token_ids)
-        response = self.make_response(generated_text, result[2], result[3], result[4])
+        response = self.make_response(generated_text=generated_text,
+                                      prompt_length=prompt_length,
+                                      generated_length=generated_length,
+                                      finish_reason=finish_reason)
         return uid, response
 
     def start(self) -> None:
